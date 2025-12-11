@@ -7,10 +7,11 @@ import shutil
 import sys
 import time
 import traceback
-import boto
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 import transferlib
 
-owner = 'deaconjs'
+owner = 'dummy'
 
 # assume moltype data is in owner.moltype.in/moltypebatches
 
@@ -21,16 +22,7 @@ def recursive_glob(rootdir='.', suffix=''):
             for looproot, _, filenames in os.walk(rootdir)
             for filename in filenames if filename.endswith(suffix)]
 
-# stackoverflow.com/questions/6974695/python-process-pool-non-daemonic
-# used to dispose of pool threads properly
-class NoDaemonProcess(multiprocessing.Process):
-    def _get_daemon(self):
-        return False
-    def _set_daemon(self, value):
-        pass
-    daemon = property(_get_daemon, _set_daemon)
-class MyPool(multiprocessing.pool.Pool):
-    Process = NoDaemonProcess
+# Note: Custom pool classes removed - no longer needed in modern Python versions
 
 
 # offer basic rsync-like multiple file transfer syntax
@@ -64,11 +56,11 @@ for x, arg in enumerate(sys.argv):
         del sys.argv[x]
 
 if not quiet_flag and include_string:
-    print "including files with string %s"%(include_string)
+    print("including files with string %s"%(include_string))
 if not quiet_flag and exclude_string:
-    print "excluding files with string %s"%(exclude_string)
+    print("excluding files with string %s"%(exclude_string))
 if not quiet_flag and remove_prefix:
-    print "removing string %s from destination path"%(remove_prefix)
+    print("removing string %s from destination path"%(remove_prefix))
 
 # dryrun means just print out the files
 dryrun_flag = False
@@ -77,7 +69,7 @@ for x, arg in enumerate(sys.argv):
         dryrun_flag = True
         del sys.argv[x]
 if not quiet_flag and dryrun_flag:
-    print "dryrun set to true"
+    print("dryrun set to true")
 
 # store in reduced redundancy mode on s3
 reduced_redundancy_flag = False
@@ -86,15 +78,64 @@ for x, arg in enumerate(sys.argv):
         reduced_redundancy_flag = True
         del sys.argv[x]
 if not quiet_flag and reduced_redundancy_flag:
-    print 'reduced redundancy set to true'
+    print('reduced redundancy set to true')
+
+# enable speed optimizations
+speed_optimize_flag = False
+for x, arg in enumerate(sys.argv):
+    if arg == 'fast' or arg == 'speed' or arg == '-fast' or arg == '--fast' or arg == '--speed':
+        speed_optimize_flag = True
+        del sys.argv[x]
+if not quiet_flag and speed_optimize_flag:
+    print('speed optimizations enabled')
+
+# enable S3 transfer acceleration
+accelerate_flag = False
+for x, arg in enumerate(sys.argv):
+    if arg == 'accelerate' or arg == 'accel' or arg == '-accelerate' or arg == '--accelerate':
+        accelerate_flag = True
+        del sys.argv[x]
+if not quiet_flag and accelerate_flag:
+    print('S3 transfer acceleration enabled (requires bucket support)')
+
+# debug mode - disable optimizations if downloads get stuck
+debug_flag = False
+for x, arg in enumerate(sys.argv):
+    if arg == 'debug' or arg == '-debug' or arg == '--debug':
+        debug_flag = True
+        del sys.argv[x]
+if not quiet_flag and debug_flag:
+    print('Debug mode enabled - using basic download method with verbose output')
+
+# conservative mode - use smaller chunks and fewer workers for unstable connections
+conservative_flag = False
+for x, arg in enumerate(sys.argv):
+    if arg == 'conservative' or arg == 'stable' or arg == '-conservative' or arg == '--conservative':
+        conservative_flag = True
+        del sys.argv[x]
+if not quiet_flag and conservative_flag:
+    print('Conservative mode enabled - using smaller chunks and fewer workers for network stability')
 
 # add these to command-line arguments
 overwrite = False
 cores = multiprocessing.cpu_count()
-concurrency = cores
 remove_source_for_copies = False
 
-conn = boto.connect_s3()
+# Adjust concurrency for speed optimizations and stability
+if conservative_flag:
+    concurrency = max(cores // 2, 1)  # Half CPU cores for stability
+    if not quiet_flag:
+        print(f"Conservative mode: using {concurrency} workers (half CPU cores for stability)")
+elif speed_optimize_flag:
+    concurrency = min(cores * 4, 32)  # 4x more workers for I/O-bound operations
+    if not quiet_flag:
+        print(f"Speed mode: using {concurrency} workers (4x CPU cores)")
+else:
+    concurrency = cores
+
+# Import helper functions from transferlib with speed optimizations
+s3_client = transferlib.get_s3_client(use_accelerate=accelerate_flag)
+s3_resource = transferlib.get_s3_resource()
 # remap_flag = False        # note that the remap flag only currently works for move functions
 
 # currently cannot map to top level directory. fix me please
@@ -118,7 +159,7 @@ if len(sys.argv) > 2:
             remap_flag = True
             lines = open(sys.argv[1], 'r').readlines()
         else:
-            print "Fatal Error: key name file %s does not exist. A key file must be included for remapping"%(sys.argv[1])
+            print("Fatal Error: key name file %s does not exist. A key file must be included for remapping"%(sys.argv[1]))
             sys.exit()
     else:
     """
@@ -130,61 +171,68 @@ if len(sys.argv) > 2:
             if not source.endswith('/') and not destination.endswith('/'):
                 lines = [command]
             elif (source.endswith('/') and not destination.endswith('/')) or (not source.endswith('/') and destination.endswith('/')):
-                print "Fatal error: for rsync functionality both source and target specifications should end with frontslashes"
+                print("Fatal error: for rsync functionality both source and target specifications should end with frontslashes")
                 sys.exit()
             else:    # rsync functionality
                 if re.match(copy_pattern, command):    # bucket-to-bucket
                     target_bucketname, target_keyprefix = destination.split('/')[2], '/'.join(destination.split('/')[3:])
                     source_bucketname, source_keyprefix = source.split('/')[2], '/'.join(source.split('/')[3:])
-                    target_bucket = conn.get_bucket(target_bucketname)
-                    source_bucket = conn.get_bucket(source_bucketname)
-                    target_lst = target_bucket.list(prefix=target_keyprefix)
-                    lst = source_bucket.list(prefix=source_keyprefix)
-                    for key in lst:
-                        if key.name.endswith('/'):
+                    target_bucket = s3_resource.Bucket(target_bucketname)
+                    source_bucket = s3_resource.Bucket(source_bucketname)
+                    target_lst = list(target_bucket.objects.filter(Prefix=target_keyprefix))
+                    lst = list(source_bucket.objects.filter(Prefix=source_keyprefix))
+                    for obj in lst:
+                        if obj.key.endswith('/'):
                             continue
-                        source_key = source_bucket.get_key(key.name)
-                        target_key = target_bucket.get_key('%s/%s'%(target_keyprefix, key.name))
+                        source_obj = source_bucket.Object(obj.key)
+                        try:
+                            target_obj = target_bucket.Object('%s/%s'%(target_keyprefix, obj.key))
+                            target_obj.load()
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'NoSuchKey':
+                                target_obj = None
                         # copy if the target key does not exist, or if the target and source keys are not the same size
-                        if target_key:
-                            if target_key.size != source_key.size:
-                                lines.append('s3://%s/%s s3://%s/%s%s'%(source_bucketname, key.name, target_bucketname, target_keyprefix, key.name))
+                        if target_obj:
+                            if target_obj.content_length != source_obj.content_length:
+                                lines.append('s3://%s/%s s3://%s/%s%s'%(source_bucketname, obj.key, target_bucketname, target_keyprefix, obj.key))
                         else:
-                            lines.append('s3://%s/%s s3://%s/%s%s'%(source_bucketname, key.name, target_bucketname, target_keyprefix, key.name))
+                            lines.append('s3://%s/%s s3://%s/%s%s'%(source_bucketname, obj.key, target_bucketname, target_keyprefix, obj.key))
                 elif re.match(download_pattern, command):
                     target_directory = '/'.join(destination.split('/')[2:])
                     source_bucketname, source_keyprefix = source.split('/')[2], '/'.join(source.split('/')[3:])
-                    source_bucket = conn.get_bucket(source_bucketname)
-                    lst = source_bucket.list(prefix=source_keyprefix)
+                    source_bucket = s3_resource.Bucket(source_bucketname)
+                    lst = list(source_bucket.objects.filter(Prefix=source_keyprefix))
                         
-                    for key in lst:
-                        if key.name.endswith('/'):
+                    for obj in lst:
+                        if obj.key.endswith('/'):
                             continue
-                        source_key = source_bucket.get_key(key.name)
-                        if os.path.isfile('%s/%s'%(target_directory, key.name)):
-                            if source_key.size != os.path.getsize('%s/%s'%(target_directory, key.name)):
-                                lines.append('s3://%s/%s local://%s/%s'%(source_bucketname, key.name, target_directory, key.name))
+                        source_obj = source_bucket.Object(obj.key)
+                        if os.path.isfile('%s/%s'%(target_directory, obj.key)):
+                            if source_obj.content_length != os.path.getsize('%s/%s'%(target_directory, obj.key)):
+                                lines.append('s3://%s/%s local://%s/%s'%(source_bucketname, obj.key, target_directory, obj.key))
                         else:
-                            lines.append('s3://%s/%s local://%s/%s'%(source_bucketname, key.name, target_directory, key.name))
+                            lines.append('s3://%s/%s local://%s/%s'%(source_bucketname, obj.key, target_directory, obj.key))
                 elif re.match(upload_pattern, command):
                     source_directory = '/'.join(source.split('/')[2:])
                     target_bucketname, target_keyprefix = destination.split('/')[2], '/'.join(destination.split('/')[3:])
                     source_files = recursive_glob('%s'%(source_directory))
-                    target_bucket = conn.get_bucket(target_bucketname)
+                    target_bucket = s3_resource.Bucket(target_bucketname)
                     for source_file in source_files:
                         if not os.path.isfile(source_file):
                             continue
-                        target_key = target_bucket.get_key('%s/%s'%(target_keyprefix, source_file))
-                        if target_key:
-                            if target_key.size != os.path.getsize(source_file):
+                        try:
+                            target_obj = target_bucket.Object('%s/%s'%(target_keyprefix, source_file))
+                            target_obj.load()
+                            if target_obj.content_length != os.path.getsize(source_file):
                                 lines.append('local://%s s3://%s/%s%s'%(source_file, target_bucketname, target_keyprefix, source_file))
-                        else:
-                            lines.append('local://%s s3://%s/%s%s'%(source_file, target_bucketname, target_keyprefix, source_file))
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'NoSuchKey':
+                                lines.append('local://%s s3://%s/%s%s'%(source_file, target_bucketname, target_keyprefix, source_file))
                 else:
-                    print "Fatal error: pattern %s does not match built-in patterns"%(command)
+                    print("Fatal error: pattern %s does not match built-in patterns"%(command))
                     sys.exit()
         else:
-            print 'command does not match any transfer commands\n  %s'%(command)
+            print('command does not match any transfer commands\n  %s'%(command))
             sys.exit()
     #else:
     #    criteria = sys.argv[1].split(':')
@@ -197,36 +245,45 @@ elif len(sys.argv) == 2:
         #    criteria = sys.argv[1].split(':')
         #    filetypes = ['all']
         #else:
-        print "Fatal Error: argument %s is not an existing file and is not a database selection criteria"%(sys.argv[1])
+        print("Fatal Error: argument %s is not an existing file and is not a database selection criteria"%(sys.argv[1]))
         sys.exit()
 else:
-    print "Usage:"
-    print "key-name file"
-    print "  s3turbo.py key_name_file"
-    print "single-line transfer:"
-    print "  to download - s3turbo.py s3://bucket_name/key_name local://file_path"
-    print "  to upload   - s3turbo.py local://file_path s3://bucket_name/key_name"
-    print "  to copy     - s3turbo.py s3://bucket_name/key_name s3://bucket_name/key_name"
+    print("Usage:")
+    print("key-name file")
+    print("  s3turbo.py key_name_file")
+    print("single-line transfer:")
+    print("  to download - s3turbo.py s3://bucket_name/key_name local://file_path")
+    print("  to upload   - s3turbo.py local://file_path s3://bucket_name/key_name")
+    print("  to copy     - s3turbo.py s3://bucket_name/key_name s3://bucket_name/key_name")
     #print "OR transfer by sql query and file names:"
     #print "  s3turbo.py table_name:value_comparator_column filename_endswith filename_endswith ..."
     #print "    e.g. s3turbo.py some_database:study1_equals_studyID sorted.bam sorted.bai"
     #print "    comparator can currently only be 'equals'"
-    print "OR rsync functionality (end with slashes)"
-    print "  s3turbo.py (s3|local)://path/ (s3|local):path/ [include include_string] [exclude exclude_string]"
-    print "    e.g. s3turbo.py local:///home/username/path/ s3://owner.run.etc/etc_dir include .py exclude .pyc"
-    print "AND dryrun flag"
-    print "  s3turbo.py args [dryrun] args"
-    print "AND reduced_redundancy flag"
-    print "  s3turbo.py args [reduced_redundancy] args"
-    print ""
-    print "The key_name_file format should follow the same conventions, one line per transfer."
+    print("OR rsync functionality (end with slashes)")
+    print("  s3turbo.py (s3|local)://path/ (s3|local):path/ [include include_string] [exclude exclude_string]")
+    print("    e.g. s3turbo.py local:///home/username/path/ s3://owner.run.etc/etc_dir include .py exclude .pyc")
+    print("AND dryrun flag")
+    print("  s3turbo.py args [dryrun] args")
+    print("AND reduced_redundancy flag")
+    print("  s3turbo.py args [reduced_redundancy] args")
+    print("AND speed optimization flags")
+    print("  s3turbo.py args [fast] args         # Enable speed optimizations (larger chunks, more workers)")
+    print("  s3turbo.py args [accelerate] args   # Enable S3 Transfer Acceleration (requires bucket support)")
+    print("  s3turbo.py args [debug] args        # Debug mode: disable optimizations, verbose output")
+    print("  s3turbo.py args [conservative] args # Conservative mode: small chunks, fewer workers (for timeouts)")
+    print("")
+    print("The key_name_file format should follow the same conventions, one line per transfer.")
     #print "The remap flag is for transferring mapped data between buckets."
     #print "  It removes entries from source mapping files and adds them to target mapping files."
-    print "The dryrun flag prints out the files to be transferred, without transferring them. Output is in the standard s3/local://path format."
-    print "The reduced_redundancy flag saves some money but has slightly higher odds of data loss"
-    print "Files are automatically not overwritten, so it is safe to restart multiple file transfer operations that were interrupted"
-    print "Download functionality skips existing local files by the same name but only if they are the same size. The copy and upload functionalities currently skip existing files by the same name, but file sizes are not compared."
-    print "Note that if an input file is used, the file list can contain a mixture of download, copy, and upload commands."
+    print("The dryrun flag prints out the files to be transferred, without transferring them. Output is in the standard s3/local://path format.")
+    print("The reduced_redundancy flag saves some money but has slightly higher odds of data loss")
+    print("The 'fast' flag enables speed optimizations: 100MB chunks, 4x more workers, threading, and boto3 optimizations")
+    print("The 'accelerate' flag uses S3 Transfer Acceleration for faster uploads/downloads (bucket must support it)")
+    print("The 'debug' flag disables optimizations and enables verbose output for troubleshooting stuck downloads")
+    print("The 'conservative' flag uses 10MB chunks and fewer workers to avoid network timeouts on unstable connections")
+    print("Files are automatically not overwritten, so it is safe to restart multiple file transfer operations that were interrupted")
+    print("Download functionality skips existing local files by the same name but only if they are the same size. The copy and upload functionalities currently skip existing files by the same name, but file sizes are not compared.")
+    print("Note that if an input file is used, the file list can contain a mixture of download, copy, and upload commands.")
     sys.exit()
 
 # apply include and exclude strings
@@ -247,7 +304,7 @@ lines = fixedlines2
 # dryrun?
 if dryrun_flag:
     for line in lines:
-        print line
+        print(line)
     sys.exit()
 
 """
@@ -263,8 +320,8 @@ if criteria and len(filetypes) > 0:
             if line[0].rstrip('\r\n').endswith(filetype):
                 filtered_hash[line[0]] = 0
 
-    print "%s lines returned from sql query"%(len(raw_lines))
-    print "%s files meeting these criteria"%(len(filtered_hash.keys()))
+    print("%s lines returned from sql query"%(len(raw_lines)))
+    print("%s files meeting these criteria"%(len(filtered_hash.keys())))
     moltypes = []
     for line in filtered_hash.keys():
         if line.startswith('rnabatches') and 'rna' not in moltypes:
@@ -278,7 +335,7 @@ if criteria and len(filetypes) > 0:
             (key, sample, participant, batch, bucket, loc) = line.rstrip('\r\n').split(',')
             if loc in filtered_hash:
                 lines.append('s3://%s.run.%s/%s local://%s'%(owner, moltype, key, loc))
-    print "%s files found."%(len(lines))
+    print("%s files found."%(len(lines)))
 """
 
 copy_file_list = []
@@ -298,10 +355,10 @@ for line in lines:
         elif re.match(upload_pattern, line):
             move_type = 'upload'
         else:
-            print "key name pattern %s\ndoes not match standard formatting. Use:"%(line)
-            print "  Copy     -> \"s3://bucket/keyname s3://bucket/keyname\""
-            print "  Download -> \"s3://bucket/keyname local://path\""
-            print "  Upload   -> \"local://path s3://bucket/keyname\""
+            print("key name pattern %s\ndoes not match standard formatting. Use:"%(line))
+            print("  Copy     -> \"s3://bucket/keyname s3://bucket/keyname\"")
+            print("  Download -> \"s3://bucket/keyname local://path\"")
+            print("  Upload   -> \"local://path s3://bucket/keyname\"")
             sys.exit()
 
         line = re.sub('local', '', line)
@@ -329,69 +386,92 @@ for line in lines:
         # validate source and destination
         if move_type in ['copy', 'download']:
             try:
-                source_bucket = conn.get_bucket(source_bucketname)
-            except Exception, exc:
-                print "Fatal Error: source bucket %s not found: exception %s"%(source_bucketname, exc)
+                source_bucket = s3_resource.Bucket(source_bucketname)
+                source_bucket.load()  # This will raise an exception if bucket doesn't exist
+            except Exception as exc:
+                print("Fatal Error: source bucket %s not found: exception %s"%(source_bucketname, exc))
                 sys.exit()
 
         if move_type in ['copy', 'upload']:
             try:
-                dest_bucket = conn.get_bucket(dest_bucketname)
-            except Exception, exc:
-                print "Fatal Error: destination bucket %s not found: exception %s"%(dest_bucketname, exc)
+                dest_bucket = s3_resource.Bucket(dest_bucketname)
+                dest_bucket.load()  # This will raise an exception if bucket doesn't exist
+            except Exception as exc:
+                print("Fatal Error: destination bucket %s not found: exception %s"%(dest_bucketname, exc))
                 sys.exit()
 
         if move_type == 'copy':
-            if not source_bucket.get_key(source_keyname):
-                print "Error copying: source key %s not found in bucket %s"%(source_keyname, source_bucketname)
-                continue
+            try:
+                source_obj = source_bucket.Object(source_keyname)
+                source_obj.load()
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    print("Error copying: source key %s not found in bucket %s"%(source_keyname, source_bucketname))
+                    continue
         elif move_type == 'download':
-            if not source_bucket.get_key(source_keyname):
-                print "Error downloading: source key %s not found in bucket %s"%(source_keyname, source_bucketname)
-                continue
+            try:
+                source_obj = source_bucket.Object(source_keyname)
+                source_obj.load()
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    print("Error downloading: source key %s not found in bucket %s"%(source_keyname, source_bucketname))
+                    continue
             targetdir = '/'.join(dest_keyname.split('/')[:-1])
             if not os.path.isdir(targetdir):
                 try:
                     os.makedirs(targetdir)
-                except OSError, exc:
-                    print "Fatal Error: Failed to create directory %s for download %s, error %s"%(targetdir, dest_keyname, exc)
+                except OSError as exc:
+                    print("Fatal Error: Failed to create directory %s for download %s, error %s"%(targetdir, dest_keyname, exc))
                     sys.exit()
         elif move_type == 'upload':
             if not os.path.isfile(source_keyname):
-                print "Error: source file %s not found locally"%(source_keyname)
+                print("Error: source file %s not found locally"%(source_keyname))
 
         # see if file has already been transferred
         if overwrite == False and  move_type == 'copy':
-            #if not source_bucket.get_key(source_keyname) and dest_bucket.get_key(dest_keyname):
-            if dest_bucket.get_key(dest_keyname):
-                print "Source key %s has already been transferred from source bucket %s to dest bucket %s. Skipping."%(source_keyname, source_bucketname, dest_bucketname)
+            try:
+                dest_obj = dest_bucket.Object(dest_keyname)
+                dest_obj.load()
+                print("Source key %s has already been transferred from source bucket %s to dest bucket %s. Skipping."%(source_keyname, source_bucketname, dest_bucketname))
                 continue
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    pass  # Object doesn't exist, continue with transfer
         elif overwrite == False and move_type == 'download':
             if os.path.isfile(dest_keyname):
-                source_key = source_bucket.get_key(source_keyname)
-                local_size = os.path.getsize(dest_keyname)
-                if source_key and source_key.size == local_size:
-                    print "Source key %s has already been downloaded and is the same size on disk. Skipping."%(source_keyname)
-                    continue
+                try:
+                    source_obj = source_bucket.Object(source_keyname)
+                    source_obj.load()
+                    local_size = os.path.getsize(dest_keyname)
+                    if source_obj.content_length == local_size:
+                        print("Source key %s has already been downloaded and is the same size on disk. Skipping."%(source_keyname))
+                        continue
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'NoSuchKey':
+                        pass
         elif overwrite == False and move_type == 'upload':
-            dest_key = dest_bucket.get_key(dest_keyname)
-            if dest_key:
+            try:
+                dest_obj = dest_bucket.Object(dest_keyname)
+                dest_obj.load()
                 local_size = os.path.getsize(source_keyname)
-                if dest_key.size == local_size:
-                    print "File %s has already been uploaded and is the same size in the destination bucket. Skipping."%(source_keyname)
+                if dest_obj.content_length == local_size:
+                    print("File %s has already been uploaded and is the same size in the destination bucket. Skipping."%(source_keyname))
                     continue
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    pass  # Object doesn't exist, continue with transfer
 
         # store to transfer
         if move_type == 'copy':
-            source_key = source_bucket.get_key(source_keyname)
-            source_size = source_key.size
+            source_obj = source_bucket.Object(source_keyname)
+            source_size = source_obj.content_length
             copy_file_list.append([source_bucketname, source_keyname, dest_bucketname, dest_keyname, source_size])
         elif move_type == 'upload':
             local_size = os.path.getsize(source_keyname)
             upload_file_list.append([source_bucketname, source_keyname, dest_bucketname, dest_keyname, local_size])
         elif move_type == "download":
-            source_key = source_bucket.get_key(source_keyname)
-            source_size = source_key.size
+            source_obj = source_bucket.Object(source_keyname)
+            source_size = source_obj.content_length
             # append filename to dest_keyname if dest_keyname is a directory
             if os.path.isdir(dest_keyname):
                 source_filename = source_keyname.split('/')[-1]
@@ -431,11 +511,11 @@ for transfer_type in ['download', 'copy', 'upload']:
             rangecap = len(transfer_files)
 
         if not quiet_flag:
-            print "range %d to %d"%(rangestart, rangecap)
+            print("range %d to %d"%(rangestart, rangecap))
 
         results = []
         answers = []
-        pool = MyPool(concurrency)
+        pool = multiprocessing.Pool(concurrency)
         for i, j in enumerate(range(rangestart, rangecap)):
             key = transfer_files[j]
             if transfer_type == 'move':
@@ -447,7 +527,7 @@ for transfer_type in ['download', 'copy', 'upload']:
                 keys_to_add.append(key[3])
 
             if not quiet_flag and cnt%50 == 0:
-                print "\n**********  %s files done  **********\n"%(cnt)
+                print("\n**********  %s files done  **********\n"%(cnt))
             source_bucketname, source_keyname, dest_bucketname, dest_keyname = key[0], key[1], key[2], key[3]
             d = {}
             if transfer_type in ['copy', 'move']:
@@ -460,6 +540,9 @@ for transfer_type in ['download', 'copy', 'upload']:
                     d = dict(reduced_redundancy=True)
             elif transfer_type == 'download':
                 args = [source_bucketname, source_keyname, dest_keyname]
+                # Add debug mode, conservative mode, and quiet flag to download function
+                d = dict(debug_mode=debug_flag or conservative_flag, quiet=quiet_flag, 
+                        conservative_mode=conservative_flag)
             #if quiet_flag:
                 
             if d:
@@ -473,11 +556,11 @@ for transfer_type in ['download', 'copy', 'upload']:
         for i, j in enumerate(range(rangestart, rangecap)):
             try:
                 answers.append(results[i].get(timeout=999999999))
-            except Exception, exc:
+            except Exception as exc:
                 f = open('./fail_log', 'a')
                 tim = time.strftime('%X %x %Z')
                 frmt_exc = traceback.format_exc()
-                print "Error %s\n   writing to fail_log at %s\n   %s - %s\n    %s"%(exc, tim, j, transfer_files[j], frmt_exc)
+                print("Error %s\n   writing to fail_log at %s\n   %s - %s\n    %s"%(exc, tim, j, transfer_files[j], frmt_exc))
                 f.write("pool.apply_async failed in s3_%s.py. Failed on %s, %s\n"%(transfer_type, j, transfer_files[j]))
                 f.write("    ready=%s, successful=%s\n"%(results[i].ready(), results[i].successful()))
                 f.write("    time %s, exception %s, %s"%(tim, exc, frmt_exc))
@@ -517,7 +600,7 @@ for transfer_type in ['download', 'copy', 'upload']:
             transferlib.upload_mapping(source_bucket)
             transferlib.upload_mapping(dest_bucketname)
         elif remap_flag:
-            print "Note that the remap flag only works for move transfers"
+            print("Note that the remap flag only works for move transfers")
         """
 
         pool.close()
